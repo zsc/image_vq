@@ -11,6 +11,7 @@ setup(
         "einops",
         "Pillow",
         "huggingface_hub",
+        "pillow-avif-plugin",
     ],
     entry_points={
         "console_scripts": [

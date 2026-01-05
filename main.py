@@ -8,6 +8,10 @@ import torch
 import torch.nn as nn
 from einops import rearrange, pack, unpack
 from PIL import Image
+try:
+    import pillow_avif
+except ImportError:
+    pass
 from huggingface_hub import hf_hub_download
 
 # -----------------------------------------------------------------------------

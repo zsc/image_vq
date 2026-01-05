@@ -3,3 +3,4 @@ torch
 einops
 Pillow
 huggingface_hub
+pillow-avif-plugin
