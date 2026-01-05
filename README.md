@@ -14,7 +14,7 @@
 
 ```bash
 git clone <repository-url>
-cd Open-Magvit2-demo
+cd image_vq
 pip install -e .
 ```
 

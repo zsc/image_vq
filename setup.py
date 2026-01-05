@@ -1,9 +1,9 @@
 from setuptools import setup
 
 setup(
-    name="open-magvit2-demo",
+    name="image_vq",
     version="0.1.0",
-    description="Open-MAGVIT2 Inference Demo",
+    description="Image VQ: Open-MAGVIT2 Inference Tool",
     py_modules=["main"],
     install_requires=[
         "numpy",
