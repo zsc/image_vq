@@ -2,6 +2,7 @@ import sys
 import os
 import math
 import json
+import base64
 import argparse
 import numpy as np
 import torch
@@ -319,6 +320,56 @@ def indices_to_quant(indices, C=18):
     quant = bits.float() * 2.0 - 1.0
     return quant
 
+def pack_quant_to_b64(quant):
+    # quant: [B, 18, H, W] in {-1, 1} or float
+    # Pack into bits and base64
+    B, C, H, W = quant.shape
+    assert C == 18
+    
+    # 1. Convert to bits: 0 for -1, 1 for 1
+    # [B, 18, H, W] -> [B, H, W, 18]
+    quant_perm = quant.permute(0, 2, 3, 1).contiguous()
+    bits = (quant_perm > 0).to(torch.uint8).cpu().numpy()
+    
+    # Flatten
+    bits_flat = bits.flatten() # Total bits = B*H*W*18
+    
+    # Pack into bytes
+    packed_bytes = np.packbits(bits_flat)
+    
+    # Base64 encode
+    b64_str = base64.b64encode(packed_bytes.tobytes()).decode('utf-8')
+    return b64_str
+
+def unpack_b64_to_quant(b64_str, latent_shape, C=18):
+    # latent_shape: [B, H, W]
+    B, H, W = latent_shape
+    total_bits = B * H * W * C
+    
+    # Decode base64
+    bytes_data = base64.b64decode(b64_str)
+    
+    # Unpack bits
+    # np.frombuffer creates a read-only array, copy to make it writable/usable
+    packed_arr = np.frombuffer(bytes_data, dtype=np.uint8)
+    bits = np.unpackbits(packed_arr)
+    
+    # Truncate padding
+    bits = bits[:total_bits]
+    
+    # Reshape: [B, H, W, 18]
+    bits = bits.reshape(B, H, W, C)
+    
+    # Convert to tensor and permute back to [B, 18, H, W]
+    bits_tensor = torch.from_numpy(bits).float() # 0.0 or 1.0
+    
+    # Map 0 -> -1.0, 1 -> 1.0
+    quant = bits_tensor * 2.0 - 1.0
+    
+    # [B, H, W, C] -> [B, C, H, W]
+    quant = quant.permute(0, 3, 1, 2)
+    return quant
+
 # -----------------------------------------------------------------------------
 # Main Logic
 # -----------------------------------------------------------------------------
@@ -439,15 +490,15 @@ def process_image_to_tokens(model, img_path, output_path, device, args):
             
     print(f"Final Selection: {best_res[0]}x{best_res[1]} (Tokens: {best_quant.shape[2]*best_quant.shape[3]}) with PSNR {best_psnr:.2f} dB")
     
-    # Save Tokens
-    indices = quant_to_indices(best_quant)
-    indices_list = indices.flatten().cpu().tolist()
+    # Save Tokens as Base64 Bitset
+    # Note: quant is [B, 18, H, W]
+    b64_str = pack_quant_to_b64(best_quant)
     
     data = {
         "original_size": (original_w, original_h),
         "resolution": best_res,
-        "latent_shape": list(indices.shape),
-        "tokens": indices_list
+        "latent_shape": list(best_quant.shape)[0:1] + list(best_quant.shape)[2:], # [B, H, W]
+        "tokens_b64": b64_str
     }
     
     if output_path is None:
@@ -456,8 +507,21 @@ def process_image_to_tokens(model, img_path, output_path, device, args):
         
     with open(output_path, "w") as f:
         json.dump(data, f)
+        
+    # Compression Ratio vs AVIF
+    # Save temp AVIF to measure size
+    temp_avif = "temp_compare.avif"
+    best_rec_img.save(temp_avif, format="AVIF", quality=80) # Default quality approx
+    
+    json_size = os.path.getsize(output_path)
+    avif_size = os.path.getsize(temp_avif)
+    
+    if os.path.exists(temp_avif):
+        os.remove(temp_avif)
+        
     print(f"Saved tokens to {output_path}")
     print(f"Final Reconstruction PSNR: {best_psnr:.2f} dB")
+    print(f"Compression: JSON {json_size/1024:.1f}KB vs AVIF {avif_size/1024:.1f}KB (Ratio: {avif_size/json_size:.2f}x)")
     
     # Debug HTML
     if args.debug:
@@ -475,7 +539,7 @@ def process_image_to_tokens(model, img_path, output_path, device, args):
         <h1>Tokenization Debug Report</h1>
         <p><b>Original Image:</b> {img_path} ({original_w}x{original_h})</p>
         <p><b>Selected Resolution:</b> {best_res} (PSNR: {best_psnr:.2f} dB)</p>
-        <p><b>Tokens:</b> {len(indices_list)}</p>
+        <p><b>Tokens:</b> {len(b64_str)} (Base64)</p>
         <div style="display:flex; gap:20px;">
             <div><h3>Original</h3><img src="{input_name}" width="500"></div>
             <div><h3>Reconstruction</h3><img src="{rec_name}" width="500"></div>
@@ -484,7 +548,7 @@ def process_image_to_tokens(model, img_path, output_path, device, args):
         <ul>
         """
         for log in search_logs:
-            html += f"<li>{log['resolution']}: {log['psnr']:.2f} dB ({log['tokens']} tokens)</li>"
+            html += f"<li>{log['resolution']}: {log['psnr']:.2f} dB</li>"
         html += "</ul></body></html>"
         
         with open(os.path.join(demo_dir, "index.html"), "w") as f:
@@ -495,12 +559,19 @@ def process_tokens_to_image(model, json_path, output_path, device, args):
     print(f"Loading tokens from: {json_path}")
     with open(json_path, "r") as f:
         data = json.load(f)
-        
-    shape = data["latent_shape"]
-    tokens = torch.tensor(data["tokens"], dtype=torch.int32).to(device)
-    tokens = tokens.view(*shape)
     
-    quant = indices_to_quant(tokens, C=18).to(device)
+    if "tokens_b64" in data:
+        latent_shape = data["latent_shape"] # [B, H, W]
+        b64_str = data["tokens_b64"]
+        quant = unpack_b64_to_quant(b64_str, latent_shape).to(device)
+    elif "tokens" in data:
+        # Fallback for old format
+        shape = data["latent_shape"]
+        tokens = torch.tensor(data["tokens"], dtype=torch.int32).to(device)
+        tokens = tokens.view(*shape)
+        quant = indices_to_quant(tokens, C=18).to(device)
+    else:
+        raise ValueError("Invalid JSON: 'tokens_b64' or 'tokens' not found.")
     
     print("Decoding tokens...")
     with torch.no_grad():
