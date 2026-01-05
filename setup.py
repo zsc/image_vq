@@ -14,7 +14,7 @@ setup(
     ],
     entry_points={
         "console_scripts": [
-            "open-magvit2-demo=main:main",
+            "image_vq=main:main",
         ],
     },
 )

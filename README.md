@@ -20,21 +20,21 @@ pip install -e .
 
 ## 使用方法
 
-安装后，你可以直接使用 `open-magvit2-demo` 命令：
+安装后，你可以直接使用 `image_vq` 命令：
 
 ### 1. 图像转 Token (Tokenization)
 ```bash
 # 自动搜索合适尺寸并生成 .json
-open-magvit2-demo 你的图片.png
+image_vq 你的图片.png
 
 # 开启调试模式并指定目标质量
-open-magvit2-demo 你的图片.png --target-psnr 35.0 --debug
+image_vq 你的图片.png --target-psnr 35.0 --debug
 ```
 
 ### 2. Token 转图像 (Reconstruction)
 ```bash
 # 自动识别 .json 输入并还原图片
-open-magvit2-demo 你的数据.json -o 还原图.png
+image_vq 你的数据.json -o 还原图.png
 ```
 
 ## JSON 文件格式设计
