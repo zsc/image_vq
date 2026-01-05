@@ -1,0 +1,5 @@
+numpy
+torch
+einops
+Pillow
+huggingface_hub
