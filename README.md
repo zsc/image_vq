@@ -5,11 +5,10 @@
 ## 功能特点
 
 - **双向转换**：支持 `图像 -> JSON Token` (Encode) 和 `JSON Token -> 图像` (Decode)。
-- **自适应分辨率 (Adaptive Res)**：自动进行试错搜索（Trial-and-error），寻找满足目标 PSNR（默认 32dB）的最小分辨率。
+- **自适应分辨率 (Adaptive Res)**：自动进行试错搜索，寻找满足目标 PSNR 的最小分辨率。支持自动 **Upscale** 以满足高质量需求（长边最高支持 2048px）。
 - **多格式支持**：支持常见图像格式，并已通过 `pillow-avif-plugin` 扩展支持 **AVIF** 格式。
-- **细节保留**：通过计算重建图像与原始大图之间的 PSNR，确保文字等细节在特定尺寸下被充分保留。
+- **细节保留**：保持原始图像长宽比，通过计算重建图像与原始大图之间的 PSNR，确保细节被充分保留。
 - **标准 CLI 界面**：安装后可直接作为系统命令使用。
-- **调试模式**：仅在开启 `--debug` 时生成可视化 HTML 报告。
 
 ## 安装步骤
 
@@ -25,20 +24,20 @@ pip install -e .
 
 ### 1. 图像转 Token (Tokenization)
 ```bash
-# 自动搜索合适尺寸并生成 .json
+# 自动搜索合适尺寸（支持 Upscale）并生成 .json
 image_vq 你的图片.png
 
-# 开启调试模式并指定目标质量
-image_vq 你的图片.png --target-psnr 35.0 --debug
+# 指定目标质量（如 40dB）
+image_vq 你的图片.png --psnr 40.0
 ```
 
 ### 2. Token 转图像 (Reconstruction)
 ```bash
 # 自动识别 .json 输入并还原图片
-open-magvit2-demo 你的数据.json -o 还原图.png
+image_vq 你的数据.json -o 还原图.png
 
 # 使用 --avif 标志将输出保存为 .avif 格式
-open-magvit2-demo 你的数据.json --avif
+image_vq 你的数据.json --avif
 ```
 
 ## JSON 文件格式设计
@@ -48,7 +47,7 @@ Token 文件采用 JSON 格式存储，包含重建图像所需的全部元数�
 ```json
 {
   "original_size": [1672, 2508],  // 原始图像的 [宽, 高]，用于还原
-  "resolution": [512, 512],       // Tokenize 时使用的缩放尺寸
+  "resolution": [512, 512],       // Tokenize 时使用的缩放尺寸（可能大于原图）
   "latent_shape": [1, 64, 64],    // 潜空间张量形状 [B, H, W]
   "tokens": [123, 456, ...]       // 扁平化的整数 Token 序列 (0 ~ 262143)
 }
@@ -61,9 +60,10 @@ Token 文件采用 JSON 格式存储，包含重建图像所需的全部元数�
 
 - `input_path`: 输入文件路径（图片或 .json）。
 - `-o, --output`: 输出路径（默认自动生成）。
-- `--target-psnr`: 自动搜索时的目标 PSNR 值（默认 32.0）。
-- `--size`: 强制指定固定尺寸，跳过自动搜索。
+- `--psnr`: 自动搜索时的目标 PSNR 值（默认 32.0）。
+- `--size`: 强制指定固定尺寸（长边），跳过自动搜索。
 - `--debug`: 开启后会在 `demo/` 目录生成 `index.html` 报告。
+- `--avif`: 指定输出格式为 AVIF。
 
 ## 参考
 - 模型权重：[TencentARC/Open-MAGVIT2](https://huggingface.co/TencentARC/Open-MAGVIT2-Tokenizer-128-resolution)

@@ -301,15 +301,9 @@ def quant_to_indices(quant):
     # quant: [B, C, H, W] in {-1, 1}
     # returns: [B, H, W] int32 indices
     C = quant.shape[1]
-    # Create power of 2 basis
     basis = 2 ** torch.arange(C, device=quant.device, dtype=torch.int32)
-    # [1, C, 1, 1]
     basis = basis.view(1, C, 1, 1)
-    
-    # Convert -1 -> 0, 1 -> 1
     bits = (quant > 0).int()
-    
-    # Sum bits * basis
     indices = torch.sum(bits * basis, dim=1)
     return indices
 
@@ -318,18 +312,10 @@ def indices_to_quant(indices, C=18):
     # returns: [B, C, H, W] float32 in {-1, 1}
     B, H, W = indices.shape
     device = indices.device
-    
-    # Create basis
-    basis = 2 ** torch.arange(C, device=device, dtype=torch.int32) # [C]
-    
-    # Expand indices: [B, 1, H, W]
+    basis = 2 ** torch.arange(C, device=device, dtype=torch.int32)
     indices_expanded = indices.unsqueeze(1)
-    
-    # Extract bits: (indices & basis) != 0
-    # [B, C, H, W]
     basis_expanded = basis.view(1, C, 1, 1)
     bits = (indices_expanded & basis_expanded) != 0
-    
     quant = bits.float() * 2.0 - 1.0
     return quant
 
@@ -383,11 +369,13 @@ def process_image_to_tokens(model, img_path, output_path, device, args):
     original_pil = Image.open(img_path).convert("RGB")
     original_w, original_h = original_pil.size
     
-    candidates = [128, 256, 384, 512, 640, 768, 1024]
+    # Candidates represent the "long edge" size
+    candidates = [256, 384, 512, 640, 768, 1024, 1280, 1536, 1792, 2048]
+    
     if args.size:
         candidates = [args.size]
     
-    best_res = candidates[-1]
+    best_res = (0,0)
     best_psnr = -1.0
     best_quant = None
     best_rec_img = None
@@ -396,24 +384,19 @@ def process_image_to_tokens(model, img_path, output_path, device, args):
 
     print("Starting adaptive resolution search..." if not args.size else f"Using fixed resolution: {args.size}")
     
-    for res in candidates:
-        # Snap to multiple of 8
-        H, W = res, res 
-        # Preserve aspect ratio logic could be added here, but usually square or fixed resize is used in VQ
-        # Let's stick to square resize as per original demo, or maybe adaptive aspect ratio?
-        # The user said "text heavy needs larger size". 
-        # Let's resize maintaining aspect ratio but max edge is 'res', then padding? 
-        # Or just simple resize. Simple resize is standard for these models unless it's vari-resolution trained.
-        # MAGVIT2 handles vari-res. Let's try to keep aspect ratio?
-        # For simplicity and robustness with the model config (which says resolution=128), let's just resize to (res, res) or (W, H) multiples of 8.
+    for max_dim in candidates:
+        # Calculate dimensions preserving aspect ratio
+        scale = max_dim / max(original_w, original_h)
+        t_W = int(original_w * scale)
+        t_H = int(original_h * scale)
         
-        # Implementation: Resize to fixed square 'res' for tokenizer input.
-        # Why? Model config usually handles variable sizes but typically trained on square crops.
+        # Ensure multiple of 8
+        t_W = ((t_W + 7) // 8) * 8
+        t_H = ((t_H + 7) // 8) * 8
         
-        # Resize input
-        t_H = ((res + 7) // 8) * 8
-        t_W = ((res + 7) // 8) * 8
-        
+        if t_W < 16 or t_H < 16:
+            continue
+
         img_resized = original_pil.resize((t_W, t_H), Image.BICUBIC)
         
         # To Tensor
@@ -436,7 +419,7 @@ def process_image_to_tokens(model, img_path, output_path, device, args):
         # Calculate PSNR against ORIGINAL image
         psnr = calculate_psnr(np.array(original_pil), np.array(rec_upscaled))
         
-        print(f"  Resolution {t_W}x{t_H} -> Tokens: {quant.shape[2]*quant.shape[3]} -> PSNR (vs Original): {psnr:.2f} dB")
+        print(f"  Max Edge {max_dim} -> Resolution {t_W}x{t_H} -> PSNR (vs Original): {psnr:.2f} dB")
         
         search_logs.append({
             "resolution": (t_W, t_H),
@@ -450,20 +433,20 @@ def process_image_to_tokens(model, img_path, output_path, device, args):
         best_psnr = psnr
         best_rec_img = rec_pil
         
-        if psnr >= args.target_psnr:
-            print(f"  [+] Target PSNR {args.target_psnr} dB reached. Stopping search.")
+        if psnr >= args.psnr:
+            print(f"  [+] Target PSNR {args.psnr} dB reached.")
             break
             
-    print(f"Selected resolution: {best_res[0]}x{best_res[1]} with PSNR {best_psnr:.2f} dB")
+    print(f"Final Selection: {best_res[0]}x{best_res[1]} (Tokens: {best_quant.shape[2]*best_quant.shape[3]}) with PSNR {best_psnr:.2f} dB")
     
     # Save Tokens
-    indices = quant_to_indices(best_quant) # [B, H_latent, W_latent]
+    indices = quant_to_indices(best_quant)
     indices_list = indices.flatten().cpu().tolist()
     
     data = {
         "original_size": (original_w, original_h),
         "resolution": best_res,
-        "latent_shape": list(indices.shape), # [1, H, W]
+        "latent_shape": list(indices.shape),
         "tokens": indices_list
     }
     
@@ -474,6 +457,7 @@ def process_image_to_tokens(model, img_path, output_path, device, args):
     with open(output_path, "w") as f:
         json.dump(data, f)
     print(f"Saved tokens to {output_path}")
+    print(f"Final Reconstruction PSNR: {best_psnr:.2f} dB")
     
     # Debug HTML
     if args.debug:
@@ -481,7 +465,6 @@ def process_image_to_tokens(model, img_path, output_path, device, args):
         if not os.path.exists(demo_dir):
             os.makedirs(demo_dir)
             
-        # Save images
         input_name = "debug_input.png"
         rec_name = "debug_output.png"
         original_pil.save(os.path.join(demo_dir, input_name))
@@ -513,12 +496,10 @@ def process_tokens_to_image(model, json_path, output_path, device, args):
     with open(json_path, "r") as f:
         data = json.load(f)
         
-    shape = data["latent_shape"] # [B, H, W]
+    shape = data["latent_shape"]
     tokens = torch.tensor(data["tokens"], dtype=torch.int32).to(device)
     tokens = tokens.view(*shape)
     
-    # Recover quant
-    # quant shape: [B, 18, H, W]
     quant = indices_to_quant(tokens, C=18).to(device)
     
     print("Decoding tokens...")
@@ -530,12 +511,8 @@ def process_tokens_to_image(model, json_path, output_path, device, args):
     rec = np.clip(rec, 0, 255).astype(np.uint8)
     rec_img = Image.fromarray(rec)
     
-    # Optional: resize back to original_size if stored
     if "original_size" in data:
         orig_w, orig_h = data["original_size"]
-        # Only resize if significantly different? 
-        # Usually users might want the raw reconstruction.
-        # But to be consistent with the "inverse" operation, let's restore it.
         if (orig_w, orig_h) != rec_img.size:
              print(f"Restoring original size: {orig_w}x{orig_h}")
              rec_img = rec_img.resize((orig_w, orig_h), Image.BICUBIC)
@@ -548,12 +525,29 @@ def process_tokens_to_image(model, json_path, output_path, device, args):
     rec_img.save(output_path)
     print(f"Saved reconstructed image to {output_path}")
 
+    # Try to find original image for PSNR calculation
+    base_no_ext = os.path.splitext(json_path)[0]
+    possible_extensions = [".png", ".jpg", ".jpeg", ".webp", ".avif"]
+    ref_img = None
+    for ext in possible_extensions:
+        if os.path.exists(base_no_ext + ext):
+            ref_img = Image.open(base_no_ext + ext).convert("RGB")
+            break
+    
+    if ref_img is not None:
+        if ref_img.size != rec_img.size:
+            ref_img_resized = ref_img.resize(rec_img.size, Image.BICUBIC)
+        else:
+            ref_img_resized = ref_img
+        psnr = calculate_psnr(np.array(ref_img_resized), np.array(rec_img))
+        print(f"Reconstruction PSNR (vs original): {psnr:.2f} dB")
+
 def main():
     parser = argparse.ArgumentParser(description="Open-MAGVIT2 Tokenizer CLI")
     parser.add_argument("input_path", help="Path to input image (for tokenization) or JSON file (for reconstruction)")
     parser.add_argument("-o", "--output", help="Path to output file")
     parser.add_argument("--size", type=int, help="Force specific resolution (skip auto-search)")
-    parser.add_argument("--target-psnr", type=float, default=32.0, help="Target PSNR for auto-resolution (default: 32.0)")
+    parser.add_argument("--psnr", type=float, default=32.0, help="Target PSNR for auto-resolution (default: 32.0)")
     parser.add_argument("--debug", action="store_true", help="Generate HTML report (only for tokenization)")
     parser.add_argument("--avif", action="store_true", help="Use AVIF format for output images")
     
@@ -573,7 +567,6 @@ def main():
     if ext.lower() == ".json":
         process_tokens_to_image(model, args.input_path, args.output, device, args)
     else:
-        # Assume image
         process_image_to_tokens(model, args.input_path, args.output, device, args)
 
 if __name__ == "__main__":
