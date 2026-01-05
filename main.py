@@ -1,3 +1,4 @@
+import sys
 import os
 import math
 import numpy as np
@@ -344,6 +345,7 @@ def process_resolution(model, img, resolution, device, out_dir):
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Open-MAGVIT2 Inference Demo")
+    parser.add_argument("image_path", help="Path to the input image")
     parser.add_argument("--size", type=int, help="Specific resolution to run (will be rounded up to multiple of 8)")
     args = parser.parse_args()
 
@@ -392,7 +394,7 @@ def main():
     model.to(device)
     model.eval()
 
-    img_path = "assets/Open-MAGVIT2-teaser.png"
+    img_path = args.image_path
     if not os.path.exists(img_path):
         print(f"Image not found at {img_path}")
         return
