@@ -1,6 +1,8 @@
 import sys
 import os
 import math
+import json
+import argparse
 import numpy as np
 import torch
 import torch.nn as nn
@@ -9,14 +11,13 @@ from PIL import Image
 from huggingface_hub import hf_hub_download
 
 # -----------------------------------------------------------------------------
-# Utils & Modules from improved_model.py
+# Utils & Modules
 # -----------------------------------------------------------------------------
 
 def swish(x):
     return x*torch.sigmoid(x)
 
 def depth_to_space(x: torch.Tensor, block_size: int) -> torch.Tensor:
-    """ Depth-to-Space DCR mode (depth-column-row) core implementation. """
     if x.dim() < 3:
         raise ValueError("Expecting a channels-first (*CHW) tensor of at least 3 dimensions")
     c, h, w = x.shape[-3:]
@@ -88,13 +89,11 @@ class AdaptiveGroupNorm(nn.Module):
     
     def forward(self, x, quantizer):
         B, C, _, _ = x.shape
-        # calcuate var for scale
         scale = rearrange(quantizer, "b c h w -> b c (h w)")
         scale = scale.var(dim=-1) + self.eps 
         scale = scale.sqrt()
         scale = self.gamma(scale).view(B, C, 1, 1)
 
-        # calculate mean for bias
         bias = rearrange(quantizer, "b c h w -> b c (h w)")
         bias = bias.mean(dim=-1)
         bias = self.beta(bias).view(B, C, 1, 1)
@@ -209,10 +208,6 @@ class Decoder(nn.Module):
         z = self.conv_out(z)
         return z
 
-# -----------------------------------------------------------------------------
-# LFQ (from before)
-# -----------------------------------------------------------------------------
-
 def exists(v):
     return v is not None
 
@@ -268,10 +263,6 @@ class LFQ(nn.Module):
         
         return quantized, None, None, None
 
-# -----------------------------------------------------------------------------
-# VQModel
-# -----------------------------------------------------------------------------
-
 class VQModel(nn.Module):
     def __init__(self, ddconfig, n_embed, embed_dim):
         super().__init__()
@@ -289,70 +280,60 @@ class VQModel(nn.Module):
         return dec
 
 # -----------------------------------------------------------------------------
-# Main
+# Helpers
 # -----------------------------------------------------------------------------
 
 def calculate_psnr(img1, img2):
-    # img1, img2: [H, W, 3] uint8
-    mse = np.mean((img1.astype(np.float64) - img2.astype(np.float64)) ** 2)
+    # img1, img2: [H, W, 3] uint8 or float
+    if img1.dtype != img2.dtype:
+        img1 = img1.astype(np.float64)
+        img2 = img2.astype(np.float64)
+    mse = np.mean((img1 - img2) ** 2)
     if mse == 0:
         return float('inf')
     return 20 * math.log10(255.0 / math.sqrt(mse))
 
-def process_resolution(model, img, resolution, device, out_dir):
-    # Ensure multiple of 8
-    H, W = resolution, resolution # Square for now as per request
-    H = ((H + 7) // 8) * 8
-    W = ((W + 7) // 8) * 8
+def quant_to_indices(quant):
+    # quant: [B, C, H, W] in {-1, 1}
+    # returns: [B, H, W] int32 indices
+    C = quant.shape[1]
+    # Create power of 2 basis
+    basis = 2 ** torch.arange(C, device=quant.device, dtype=torch.int32)
+    # [1, C, 1, 1]
+    basis = basis.view(1, C, 1, 1)
     
-    img_resized = img.resize((W, H), Image.BICUBIC)
+    # Convert -1 -> 0, 1 -> 1
+    bits = (quant > 0).int()
     
-    x = np.array(img_resized).astype(np.float32) / 127.5 - 1.0
-    x = torch.from_numpy(x).permute(2, 0, 1).unsqueeze(0) # B C H W
-    x = x.to(device)
+    # Sum bits * basis
+    indices = torch.sum(bits * basis, dim=1)
+    return indices
 
-    with torch.no_grad():
-        quant = model.encode(x)
-        rec = model.decode(quant)
-
-    rec = rec.cpu().squeeze(0).permute(1, 2, 0).numpy()
-    rec = (rec + 1.0) * 127.5
-    rec = np.clip(rec, 0, 255).astype(np.uint8)
-    rec_img = Image.fromarray(rec)
+def indices_to_quant(indices, C=18):
+    # indices: [B, H, W] int32
+    # returns: [B, C, H, W] float32 in {-1, 1}
+    B, H, W = indices.shape
+    device = indices.device
     
-    # Calculate PSNR
-    original_np = np.array(img_resized)
-    psnr = calculate_psnr(original_np, rec)
+    # Create basis
+    basis = 2 ** torch.arange(C, device=device, dtype=torch.int32) # [C]
     
-    # Latent info
-    latent_h, latent_w = quant.shape[2], quant.shape[3]
-    num_tokens = latent_h * latent_w
+    # Expand indices: [B, 1, H, W]
+    indices_expanded = indices.unsqueeze(1)
     
-    # Save images
-    base_name = f"res_{W}x{H}"
-    img_resized.save(os.path.join(out_dir, f"{base_name}_input.png"))
-    rec_img.save(os.path.join(out_dir, f"{base_name}_output.png"))
+    # Extract bits: (indices & basis) != 0
+    # [B, C, H, W]
+    basis_expanded = basis.view(1, C, 1, 1)
+    bits = (indices_expanded & basis_expanded) != 0
     
-    return {
-        "resolution": (W, H),
-        "latent_res": (latent_w, latent_h),
-        "num_tokens": num_tokens,
-        "psnr": psnr,
-        "input_path": f"{base_name}_input.png",
-        "output_path": f"{base_name}_output.png"
-    }
+    quant = bits.float() * 2.0 - 1.0
+    return quant
 
-def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="Open-MAGVIT2 Inference Demo")
-    parser.add_argument("image_path", help="Path to the input image")
-    parser.add_argument("--size", type=int, help="Specific resolution to run (will be rounded up to multiple of 8)")
-    args = parser.parse_args()
+# -----------------------------------------------------------------------------
+# Main Logic
+# -----------------------------------------------------------------------------
 
-    print("Initializing...")
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
-    print(f"Using device: {device}")
-
+def load_model(device):
     ddconfig = {
         "double_z": False,
         "z_channels": 18,
@@ -365,16 +346,15 @@ def main():
     }
     n_embed = 262144
     embed_dim = 18
-    # ckpt_path = "demo/Open-Magvit2-hf/imagenet_128_L.ckpt"
     repo_id = "TencentARC/Open-MAGVIT2-Tokenizer-128-resolution"
     filename = "imagenet_128_L.ckpt"
-    print(f"Loading checkpoint {filename} from {repo_id}...")
+    
+    print(f"Loading model checkpoint from {repo_id}...")
     ckpt_path = hf_hub_download(repo_id=repo_id, filename=filename)
 
     model = VQModel(ddconfig, n_embed, embed_dim)
     
     if os.path.exists(ckpt_path):
-        print(f"Loading weights from {ckpt_path}")
         sd = torch.load(ckpt_path, map_location="cpu")
         if "state_dict" in sd:
             sd = sd["state_dict"]
@@ -385,116 +365,210 @@ def main():
                 continue
             new_sd[k] = v
             
-        msg = model.load_state_dict(new_sd, strict=False)
-        print(f"Weights loaded. {msg}")
+        model.load_state_dict(new_sd, strict=False)
+        print("Model weights loaded.")
     else:
-        print(f"Checkpoint not found at {ckpt_path}. Please check path.")
-        return
+        raise FileNotFoundError(f"Checkpoint not found at {ckpt_path}")
 
     model.to(device)
     model.eval()
+    return model
 
-    img_path = args.image_path
-    if not os.path.exists(img_path):
-        print(f"Image not found at {img_path}")
+def process_image_to_tokens(model, img_path, output_path, device, args):
+    print(f"Loading image: {img_path}")
+    original_pil = Image.open(img_path).convert("RGB")
+    original_w, original_h = original_pil.size
+    
+    candidates = [128, 256, 384, 512, 640, 768, 1024]
+    if args.size:
+        candidates = [args.size]
+    
+    best_res = candidates[-1]
+    best_psnr = -1.0
+    best_quant = None
+    best_rec_img = None
+    
+    search_logs = []
+
+    print("Starting adaptive resolution search..." if not args.size else f"Using fixed resolution: {args.size}")
+    
+    for res in candidates:
+        # Snap to multiple of 8
+        H, W = res, res 
+        # Preserve aspect ratio logic could be added here, but usually square or fixed resize is used in VQ
+        # Let's stick to square resize as per original demo, or maybe adaptive aspect ratio?
+        # The user said "text heavy needs larger size". 
+        # Let's resize maintaining aspect ratio but max edge is 'res', then padding? 
+        # Or just simple resize. Simple resize is standard for these models unless it's vari-resolution trained.
+        # MAGVIT2 handles vari-res. Let's try to keep aspect ratio?
+        # For simplicity and robustness with the model config (which says resolution=128), let's just resize to (res, res) or (W, H) multiples of 8.
+        
+        # Implementation: Resize to fixed square 'res' for tokenizer input.
+        # Why? Model config usually handles variable sizes but typically trained on square crops.
+        
+        # Resize input
+        t_H = ((res + 7) // 8) * 8
+        t_W = ((res + 7) // 8) * 8
+        
+        img_resized = original_pil.resize((t_W, t_H), Image.BICUBIC)
+        
+        # To Tensor
+        x_np = np.array(img_resized).astype(np.float32) / 127.5 - 1.0
+        x = torch.from_numpy(x_np).permute(2, 0, 1).unsqueeze(0).to(device)
+        
+        with torch.no_grad():
+            quant = model.encode(x)
+            rec = model.decode(quant)
+            
+        # Post-process reconstruction
+        rec = rec.cpu().squeeze(0).permute(1, 2, 0).numpy()
+        rec = (rec + 1.0) * 127.5
+        rec = np.clip(rec, 0, 255).astype(np.uint8)
+        rec_pil = Image.fromarray(rec)
+        
+        # Resize back to ORIGINAL size for comparison
+        rec_upscaled = rec_pil.resize((original_w, original_h), Image.BICUBIC)
+        
+        # Calculate PSNR against ORIGINAL image
+        psnr = calculate_psnr(np.array(original_pil), np.array(rec_upscaled))
+        
+        print(f"  Resolution {t_W}x{t_H} -> Tokens: {quant.shape[2]*quant.shape[3]} -> PSNR (vs Original): {psnr:.2f} dB")
+        
+        search_logs.append({
+            "resolution": (t_W, t_H),
+            "psnr": psnr,
+            "tokens": quant.shape[2]*quant.shape[3],
+            "rec_img": rec_pil if args.debug else None
+        })
+        
+        best_res = (t_W, t_H)
+        best_quant = quant
+        best_psnr = psnr
+        best_rec_img = rec_pil
+        
+        if psnr >= args.target_psnr:
+            print(f"  [+] Target PSNR {args.target_psnr} dB reached. Stopping search.")
+            break
+            
+    print(f"Selected resolution: {best_res[0]}x{best_res[1]} with PSNR {best_psnr:.2f} dB")
+    
+    # Save Tokens
+    indices = quant_to_indices(best_quant) # [B, H_latent, W_latent]
+    indices_list = indices.flatten().cpu().tolist()
+    
+    data = {
+        "original_size": (original_w, original_h),
+        "resolution": best_res,
+        "latent_shape": list(indices.shape), # [1, H, W]
+        "tokens": indices_list
+    }
+    
+    if output_path is None:
+        base, _ = os.path.splitext(img_path)
+        output_path = base + ".json"
+        
+    with open(output_path, "w") as f:
+        json.dump(data, f)
+    print(f"Saved tokens to {output_path}")
+    
+    # Debug HTML
+    if args.debug:
+        demo_dir = "demo"
+        if not os.path.exists(demo_dir):
+            os.makedirs(demo_dir)
+            
+        # Save images
+        input_name = "debug_input.png"
+        rec_name = "debug_output.png"
+        original_pil.save(os.path.join(demo_dir, input_name))
+        best_rec_img.save(os.path.join(demo_dir, rec_name))
+        
+        html = f"""
+        <html><body>
+        <h1>Tokenization Debug Report</h1>
+        <p><b>Original Image:</b> {img_path} ({original_w}x{original_h})</p>
+        <p><b>Selected Resolution:</b> {best_res} (PSNR: {best_psnr:.2f} dB)</p>
+        <p><b>Tokens:</b> {len(indices_list)}</p>
+        <div style="display:flex; gap:20px;">
+            <div><h3>Original</h3><img src="{input_name}" width="500"></div>
+            <div><h3>Reconstruction</h3><img src="{rec_name}" width="500"></div>
+        </div>
+        <h3>Search Log</h3>
+        <ul>
+        """
+        for log in search_logs:
+            html += f"<li>{log['resolution']}: {log['psnr']:.2f} dB ({log['tokens']} tokens)</li>"
+        html += "</ul></body></html>"
+        
+        with open(os.path.join(demo_dir, "index.html"), "w") as f:
+            f.write(html)
+        print(f"Debug report saved to {demo_dir}/index.html")
+
+def process_tokens_to_image(model, json_path, output_path, device, args):
+    print(f"Loading tokens from: {json_path}")
+    with open(json_path, "r") as f:
+        data = json.load(f)
+        
+    shape = data["latent_shape"] # [B, H, W]
+    tokens = torch.tensor(data["tokens"], dtype=torch.int32).to(device)
+    tokens = tokens.view(*shape)
+    
+    # Recover quant
+    # quant shape: [B, 18, H, W]
+    quant = indices_to_quant(tokens, C=18).to(device)
+    
+    print("Decoding tokens...")
+    with torch.no_grad():
+        rec = model.decode(quant)
+        
+    rec = rec.cpu().squeeze(0).permute(1, 2, 0).numpy()
+    rec = (rec + 1.0) * 127.5
+    rec = np.clip(rec, 0, 255).astype(np.uint8)
+    rec_img = Image.fromarray(rec)
+    
+    # Optional: resize back to original_size if stored
+    if "original_size" in data:
+        orig_w, orig_h = data["original_size"]
+        # Only resize if significantly different? 
+        # Usually users might want the raw reconstruction.
+        # But to be consistent with the "inverse" operation, let's restore it.
+        if (orig_w, orig_h) != rec_img.size:
+             print(f"Restoring original size: {orig_w}x{orig_h}")
+             rec_img = rec_img.resize((orig_w, orig_h), Image.BICUBIC)
+    
+    if output_path is None:
+        base, _ = os.path.splitext(json_path)
+        output_path = base + "_restored.png"
+        
+    rec_img.save(output_path)
+    print(f"Saved reconstructed image to {output_path}")
+
+def main():
+    parser = argparse.ArgumentParser(description="Open-MAGVIT2 Tokenizer CLI")
+    parser.add_argument("input_path", help="Path to input image (for tokenization) or JSON file (for reconstruction)")
+    parser.add_argument("-o", "--output", help="Path to output file")
+    parser.add_argument("--size", type=int, help="Force specific resolution (skip auto-search)")
+    parser.add_argument("--target-psnr", type=float, default=32.0, help="Target PSNR for auto-resolution (default: 32.0)")
+    parser.add_argument("--debug", action="store_true", help="Generate HTML report (only for tokenization)")
+    
+    args = parser.parse_args()
+    
+    if not os.path.exists(args.input_path):
+        print(f"Error: File not found {args.input_path}")
         return
 
-    print(f"Processing {img_path}")
-    img = Image.open(img_path).convert("RGB")
-    out_dir = "demo"
-    if not os.path.exists(out_dir):
-        os.makedirs(out_dir)
-
-    results = []
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    print(f"Using device: {device}")
     
-    resolutions_to_run = [64, 128, 192, 256, 512]
-    if args.size:
-        resolutions_to_run = [args.size]
+    model = load_model(device)
     
-    resolutions_to_run.sort()
-
-    for res in resolutions_to_run:
-        print(f"Running resolution: {res}x{res}")
-        res_data = process_resolution(model, img, res, device, out_dir)
-        results.append(res_data)
-        print(f"  PSNR: {res_data['psnr']:.2f}")
-
-    # Generate HTML
-    html_content = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Open-MAGVIT2 Multi-Resolution Reconstruction</title>
-        <style>
-            body { font-family: sans-serif; text-align: center; padding: 20px; }
-            .container { display: flex; flex-direction: column; gap: 40px; align-items: center; }
-            .row { border-bottom: 1px solid #eee; padding-bottom: 20px; }
-            .images { display: flex; justify-content: center; gap: 20px; flex-wrap: wrap; }
-            .box { display: flex; flex-direction: column; align-items: center; }
-            img { max-width: 100%; height: auto; border: 1px solid #ddd; }
-            table { margin: 0 auto; border-collapse: collapse; margin-bottom: 30px; }
-            th, td { border: 1px solid #ddd; padding: 8px 12px; }
-            th { background-color: #f4f4f4; }
-        </style>
-    </head>
-    <body>
-        <h1>Open-MAGVIT2 Reconstruction Result</h1>
-        <p>Model: imagenet_128_L | Downsampling Factor: 8</p>
-        
-        <h2>Summary</h2>
-        <table>
-            <tr>
-                <th>Resolution</th>
-                <th>Latent Size</th>
-                <th>Tokens</th>
-                <th>PSNR</th>
-            </tr>
-    """
-    
-    for r in results:
-        html_content += f"""
-            <tr>
-                <td>{r['resolution'][0]}x{r['resolution'][1]}</td>
-                <td>{r['latent_res'][0]}x{r['latent_res'][1]}</td>
-                <td>{r['num_tokens']}</td>
-                <td>{r['psnr']:.2f} dB</td>
-            </tr>
-        """
-    
-    html_content += """
-        </table>
-        
-        <div class="container">
-    """
-    
-    for r in results:
-        html_content += f"""
-            <div class="row">
-                <h3>Resolution: {r['resolution'][0]}x{r['resolution'][1]} (PSNR: {r['psnr']:.2f} dB)</h3>
-                <p>Latent: {r['latent_res'][0]}x{r['latent_res'][1]} ({r['num_tokens']} tokens)</p>
-                <div class="images">
-                    <div class="box">
-                        <h4>Input</h4>
-                        <img src="{r['input_path']}" alt="Input {r['resolution'][0]}">
-                    </div>
-                    <div class="box">
-                        <h4>Reconstructed</h4>
-                        <img src="{r['output_path']}" alt="Reconstructed {r['resolution'][0]}">
-                    </div>
-                </div>
-            </div>
-        """
-        
-    html_content += """
-        </div>
-    </body>
-    </html>
-    """
-    
-    with open(os.path.join(out_dir, "index.html"), "w") as f:
-        f.write(html_content)
-        
-    print("Done. Saved results and index.html to demo/")
+    # Determine mode
+    _, ext = os.path.splitext(args.input_path)
+    if ext.lower() == ".json":
+        process_tokens_to_image(model, args.input_path, args.output, device, args)
+    else:
+        # Assume image
+        process_image_to_tokens(model, args.input_path, args.output, device, args)
 
 if __name__ == "__main__":
     main()
