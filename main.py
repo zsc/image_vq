@@ -542,7 +542,8 @@ def process_tokens_to_image(model, json_path, output_path, device, args):
     
     if output_path is None:
         base, _ = os.path.splitext(json_path)
-        output_path = base + "_restored.png"
+        ext = ".avif" if args.avif else ".png"
+        output_path = base + "_restored" + ext
         
     rec_img.save(output_path)
     print(f"Saved reconstructed image to {output_path}")
@@ -554,6 +555,7 @@ def main():
     parser.add_argument("--size", type=int, help="Force specific resolution (skip auto-search)")
     parser.add_argument("--target-psnr", type=float, default=32.0, help="Target PSNR for auto-resolution (default: 32.0)")
     parser.add_argument("--debug", action="store_true", help="Generate HTML report (only for tokenization)")
+    parser.add_argument("--avif", action="store_true", help="Use AVIF format for output images")
     
     args = parser.parse_args()
     

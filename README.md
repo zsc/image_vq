@@ -35,7 +35,10 @@ image_vq 你的图片.png --target-psnr 35.0 --debug
 ### 2. Token 转图像 (Reconstruction)
 ```bash
 # 自动识别 .json 输入并还原图片
-image_vq 你的数据.json -o 还原图.png
+open-magvit2-demo 你的数据.json -o 还原图.png
+
+# 使用 --avif 标志将输出保存为 .avif 格式
+open-magvit2-demo 你的数据.json --avif
 ```
 
 ## JSON 文件格式设计
